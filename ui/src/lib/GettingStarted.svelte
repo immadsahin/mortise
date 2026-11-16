@@ -54,6 +54,7 @@
   const hasItem = $derived(status.item_count > 0);
   const hasBrowser = $derived(browsers.length > 0);
   const done = $derived(hasItem && hasBrowser);
+  const left = $derived((hasItem ? 0 : 1) + (hasBrowser ? 0 : 1));
 
 </script>
 
@@ -61,7 +62,9 @@
   <div class="wrap">
     <div class="card">
       <h2>Get set up</h2>
-      <p class="sub faint">Two things and you are done.</p>
+      <p class="sub faint">
+        {left === 1 ? "One more thing and you are done." : "Two things and you are done."}
+      </p>
 
       <div class="step" class:complete={hasItem}>
         <span class="tick" aria-hidden="true">
@@ -150,6 +153,9 @@
   .sub { font-size: 12.5px; margin: 4px 0 22px; }
 
   .step { display: flex; gap: 12px; padding: 14px 0; border-top: 1px solid var(--border); }
+  /* The card's padding already holds the bottom edge off; the step adding its
+     own on top left a dead band under the last control. */
+  .step:last-child { padding-bottom: 2px; }
   .step h3 { font-size: 13px; font-weight: 600; margin: 0 0 4px; }
   .step p { font-size: 12px; margin: 0; line-height: 1.5; }
   .body { min-width: 0; flex: 1; }
@@ -168,8 +174,10 @@
     color: var(--accent-ink);
   }
   .complete .tick { background: var(--ok); border-color: var(--ok); color: #15171d; }
+  .complete h3 { color: var(--text-dim); font-weight: 500; }
 
   .small { font-size: 12px; padding: 5px 11px; margin-top: 10px; }
+  .body button.ghost.small { margin-left: -11px; }
 
   kbd {
     font-family: var(--font);

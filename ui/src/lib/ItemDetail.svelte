@@ -235,10 +235,11 @@
     background: var(--bg-raised);
     box-shadow: var(--shadow-1);
     overflow: hidden;
-    /* Narrow enough that Copy stays near the value it copies. Full-bleed put
-       the button four hundred pixels from the thing it acts on, which reads
-       as two unrelated columns rather than one row. */
-    max-width: 520px;
+    /* Wide enough that a long username or URL is not squeezed into a third
+       of the pane, capped so Copy stays near the value it copies. Full-bleed
+       put the button four hundred pixels from the thing it acts on, which
+       reads as two unrelated columns rather than one row. */
+    max-width: 600px;
   }
   .field-row {
     display: grid;
