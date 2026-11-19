@@ -766,3 +766,79 @@ fn a_project_is_found_by_name_case_insensitively() {
     );
     assert!(f.vault.project_named("acme").unwrap().is_none());
 }
+
+// --- access log ---
+
+fn access(
+    project: &str,
+    outcome: mortise_vault::access_log::Outcome,
+) -> mortise_vault::access_log::AccessEvent {
+    mortise_vault::access_log::AccessEvent {
+        at_ms: 0,
+        project: project.into(),
+        environment: "dev".into(),
+        keys: Some(vec!["STRIPE_SECRET_KEY".into()]),
+        command: "npm run deploy-payroll".into(),
+        directory: "/Users/me/code/acme-payroll".into(),
+        process_chain: vec![
+            "/usr/local/bin/mortise".into(),
+            "zsh".into(),
+            "claude".into(),
+        ],
+        outcome,
+        detail: None,
+    }
+}
+
+/// The log says which project, command and agent: content, so sealed.
+#[test]
+fn the_access_log_is_sealed_newest_first_and_survives_a_reopen() {
+    use mortise_vault::access_log::Outcome;
+    let f = Fixture::new();
+    f.vault
+        .record_access(&access("acme-payroll", Outcome::AllowedOnce))
+        .unwrap();
+    f.vault
+        .record_access(&access("acme-payroll", Outcome::Denied))
+        .unwrap();
+    f.vault.checkpoint().unwrap();
+
+    let disk = String::from_utf8_lossy(&all_bytes_on_disk(&f.path)).into_owned();
+    for leak in [
+        "acme-payroll",
+        "STRIPE_SECRET_KEY",
+        "deploy-payroll",
+        "claude",
+    ] {
+        assert!(!disk.contains(leak), "{leak} is readable in the file");
+    }
+
+    let path = f.path.clone();
+    let account_key = f.account_key.clone();
+    drop(f.vault);
+    let mut reopened = Vault::open(&path).unwrap();
+    reopened.unlock(PASSWORD, &account_key).unwrap();
+    reopened.lock();
+    // Readable while locked, like search.
+    let log = reopened.access_log(10).unwrap();
+    assert_eq!(
+        log.iter().map(|e| e.outcome).collect::<Vec<_>>(),
+        [Outcome::Denied, Outcome::AllowedOnce]
+    );
+    assert!(log[0].at_ms > 0);
+}
+
+#[test]
+fn the_access_log_keeps_only_the_newest_entries() {
+    use mortise_vault::access_log::{MAX_ENTRIES, Outcome};
+    let f = Fixture::new();
+    for i in 0..=MAX_ENTRIES {
+        f.vault
+            .record_access(&access(&format!("p{i}"), Outcome::ServedByGrant))
+            .unwrap();
+    }
+    let log = f.vault.access_log(MAX_ENTRIES + 10).unwrap();
+    assert_eq!(log.len() as u32, MAX_ENTRIES);
+    assert_eq!(log[0].project, format!("p{MAX_ENTRIES}"), "newest kept");
+    assert!(log.iter().all(|e| e.project != "p0"), "oldest dropped");
+}
