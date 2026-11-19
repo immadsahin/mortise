@@ -14,6 +14,12 @@ Run a command with secrets from Mortise in its environment.
 
 Usage:
   mortise run [options] [--] <command> [args...]
+  mortise agent [-p <name>] [-e <name>] [--] <agent> [args...]
+
+`mortise agent` starts an agent (claude, codex, …) in an approved session:
+anything it runs with `mortise run` may read that environment without asking
+again, until the agent exits or 8 hours pass. Nothing is put in the agent's
+own environment.
 
 Options:
   -p, --project <name>    Project to load (default: .mortise.toml)
@@ -25,14 +31,16 @@ Options:
   -h, --help              Show this help
   -V, --version           Show the version
 
-Mortise must be running. The first request from a directory asks you to
-approve it in the app.";
+Mortise must be running. The first request from a directory, and every
+agent session, asks you to approve it in the app.";
 
 /// What to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// `mortise run …`
     Run(RunArgs),
+    /// `mortise agent …`: same shape, but only `--project`/`--env` apply.
+    Agent(RunArgs),
     /// `mortise help`
     Help,
     /// `mortise --version`
@@ -62,6 +70,15 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, String
     };
     match sub.to_str() {
         Some("run") => parse_run(args).map(Command::Run),
+        Some("agent") => {
+            let parsed = parse_run(args)?;
+            if !parsed.env_files.is_empty() || parsed.no_override {
+                return Err("--env-file and --no-override are for `mortise run`; \
+                     an agent session puts nothing in the agent's environment."
+                    .into());
+            }
+            Ok(Command::Agent(parsed))
+        }
         Some("help" | "-h" | "--help") => Ok(Command::Help),
         Some("-V" | "--version") => Ok(Command::Version),
         _ => Err(format!(
@@ -168,6 +185,24 @@ mod tests {
         );
         assert!(r.no_override);
         assert_eq!(r.command, [OsString::from("--weird")]);
+    }
+
+    #[test]
+    fn agent_takes_a_target_but_not_injection_options() {
+        let parse_agent = |a: &[&str]| {
+            parse(
+                std::iter::once("agent")
+                    .chain(a.iter().copied())
+                    .map(OsString::from),
+            )
+        };
+        let Ok(Command::Agent(a)) = parse_agent(&["-p", "api", "-e", "dev", "claude", "--resume"])
+        else {
+            panic!("expected agent");
+        };
+        assert_eq!(a.command, ["claude", "--resume"].map(OsString::from));
+        assert!(parse_agent(&["-f", "t", "claude"]).is_err());
+        assert!(parse_agent(&["--no-override", "claude"]).is_err());
     }
 
     #[test]

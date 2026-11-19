@@ -172,6 +172,7 @@ pub fn run() {
             commands::answer_cli_request,
             commands::list_cli_grants,
             commands::revoke_cli_grant,
+            commands::cli_access_log,
         ])
         .build(tauri::generate_context!())
         .expect("failed to start Mortise")

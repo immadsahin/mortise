@@ -18,6 +18,8 @@ use mortise_proxy::framing::{read_frame, write_frame};
 struct FakeApp {
     dir: tempfile::TempDir,
     requests: Arc<Mutex<Vec<Request>>>,
+    /// The kernel's view of who connected, per request.
+    peers: Arc<Mutex<Vec<i32>>>,
 }
 
 impl FakeApp {
@@ -25,12 +27,18 @@ impl FakeApp {
         let dir = tempfile::tempdir().unwrap();
         let listener = UnixListener::bind(dir.path().join("cli.sock")).unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let peers = Arc::new(Mutex::new(Vec::new()));
         let seen = requests.clone();
+        let seen_peers = peers.clone();
         std::thread::spawn(move || {
             for frames in script {
                 let Ok((mut stream, _)) = listener.accept() else {
                     return;
                 };
+                if let Some(pid) = mortise_macos::peer_pid(std::os::fd::AsRawFd::as_raw_fd(&stream))
+                {
+                    seen_peers.lock().unwrap().push(pid);
+                }
                 let body = read_frame(&mut stream).unwrap().unwrap();
                 seen.lock()
                     .unwrap()
@@ -40,7 +48,11 @@ impl FakeApp {
                 }
             }
         });
-        Self { dir, requests }
+        Self {
+            dir,
+            requests,
+            peers,
+        }
     }
 
     fn socket(&self) -> PathBuf {
@@ -119,7 +131,10 @@ fn secrets_reach_the_child_and_its_exit_code_comes_back() {
         environment,
         keys,
         command,
-    } = &app.requests()[0];
+    } = &app.requests()[0]
+    else {
+        panic!("expected an env request");
+    };
     assert_eq!(
         (project.as_str(), environment.as_str(), keys),
         ("api", "dev", &None)
@@ -161,7 +176,10 @@ fn a_template_fetches_only_what_it_names_and_overrides_in_order() {
     let asked: Vec<(String, Option<Vec<String>>)> = app
         .requests()
         .into_iter()
-        .map(|Request::Env { project, keys, .. }| (project, keys))
+        .map(|r| match r {
+            Request::Env { project, keys, .. } => (project, keys),
+            other => panic!("expected an env request, got {other:?}"),
+        })
         .collect();
     assert_eq!(
         asked,
@@ -285,4 +303,71 @@ fn nothing_to_load_is_an_error_not_a_bare_run() {
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).contains("nothing to load"), "{}", stderr(&out));
     assert!(app.requests().is_empty());
+}
+
+/// The session is bound to the pid that asked; `exec` must keep it, or the
+/// agent would not be the process the user approved.
+#[test]
+fn an_agent_session_is_started_then_the_agent_runs_as_the_same_process() {
+    let app = FakeApp::new(vec![vec![
+        Response::Waiting {
+            reason: WaitReason::Approval,
+        },
+        Response::SessionStarted { expires_at_ms: 1 },
+    ]]);
+    let out = app.mortise(&[
+        "agent",
+        "-p",
+        "api",
+        "-e",
+        "dev",
+        "--",
+        "sh",
+        "-c",
+        "printf '%s|%s' \"$$\" \"${TOKEN-unset}\"",
+    ]);
+
+    let (pid, token) = stdout(&out)
+        .split_once('|')
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .unwrap();
+    assert_eq!(
+        pid.parse::<i32>().unwrap(),
+        app.peers.lock().unwrap()[0],
+        "agent is the approved process"
+    );
+    assert_eq!(
+        token, "unset",
+        "an agent session injects nothing into the agent"
+    );
+    assert!(
+        stderr(&out).contains("session started for api/dev"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(
+        matches!(&app.requests()[0], Request::StartSession { project, environment, command }
+        if project == "api" && environment == "dev" && command.starts_with("sh -c"))
+    );
+}
+
+#[test]
+fn a_refused_agent_session_does_not_start_the_agent() {
+    let app = FakeApp::new(vec![vec![Response::error(
+        ErrorCode::Denied,
+        "Access was denied in Mortise.",
+    )]]);
+    let marker = app.dir.path().join("ran");
+    let out = app.mortise(&[
+        "agent",
+        "-p",
+        "api",
+        "-e",
+        "dev",
+        "--",
+        "touch",
+        marker.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!marker.exists());
 }

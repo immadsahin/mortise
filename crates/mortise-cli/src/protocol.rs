@@ -31,6 +31,21 @@ pub enum Request {
         /// chain beside it come from the kernel, not from here.
         command: String,
     },
+    /// Start an agent session: the process making this request is about to
+    /// `exec` an agent, and anything that agent runs may then read this
+    /// environment without asking again, until it exits or the session ends.
+    ///
+    /// The session is bound to this connection's process as the kernel
+    /// reports it — pid and start time — so it cannot be claimed by a
+    /// process outside the agent's tree.
+    StartSession {
+        /// Project name, matched case-insensitively.
+        project: String,
+        /// Environment name, matched exactly.
+        environment: String,
+        /// The agent about to run, for the approval prompt. A claim.
+        command: String,
+    },
 }
 
 /// What the app answers.
@@ -46,6 +61,11 @@ pub enum Response {
     Env {
         /// Sorted by key.
         vars: Vec<Var>,
+    },
+    /// The agent session is live. Final.
+    SessionStarted {
+        /// When it ends at the latest, in Unix milliseconds.
+        expires_at_ms: u64,
     },
     /// The request was refused or failed. Final.
     Error {

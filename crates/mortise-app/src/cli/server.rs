@@ -21,9 +21,12 @@ use mortise_proxy::framing::{read_frame, write_frame};
 use mortise_vault::Vault;
 use tauri::{AppHandle, Emitter, Manager};
 
-use super::access::{Answer, CliAccess, RequestSummary, grant_root_on_disk};
+use super::access::{
+    Answer, CliAccess, Coverage, ProcessKey, RequestKind, RequestSummary, grant_root_on_disk,
+};
 use crate::dto::sanitize_display;
 use crate::state::AppState;
+use mortise_vault::access_log::{AccessEvent, Outcome};
 
 /// How long a request waits for the user to unlock, and separately to
 /// approve, before giving up.
@@ -32,8 +35,12 @@ pub const USER_WAIT: Duration = Duration::from_secs(120);
 /// How often to look for an unlock while waiting for one.
 const UNLOCK_POLL: Duration = Duration::from_millis(300);
 
-/// Ancestors of the requesting process shown in the prompt.
-const CHAIN_DEPTH: usize = 4;
+/// How far up the process tree to look when matching agent sessions. Real
+/// trees are a dozen deep at most; the cap only bounds a pathological one.
+const MAX_ANCESTRY: usize = 64;
+
+/// Entries of the process chain shown in the prompt and the log.
+const CHAIN_SHOWN: usize = 5;
 
 /// Start listening. Returns once bound; serving continues in the background.
 pub fn start(app: &AppHandle) -> io::Result<PathBuf> {
@@ -57,72 +64,160 @@ fn send(stream: &mut UnixStream, response: &Response) -> io::Result<()> {
 }
 
 fn handle(app: &AppHandle, stream: &mut UnixStream, request: Request) -> Response {
-    let Request::Env {
-        project,
-        environment,
-        keys,
-        command,
-    } = request;
+    let (kind, project, environment, keys, command) = match request {
+        Request::Env {
+            project,
+            environment,
+            keys,
+            command,
+        } => (RequestKind::Run, project, environment, keys, command),
+        Request::StartSession {
+            project,
+            environment,
+            command,
+        } => (RequestKind::Session, project, environment, None, command),
+    };
 
     // Who is asking, according to the kernel. Refuse anything unidentified
     // rather than prompting about a process we cannot describe.
     let Some(pid) = mortise_macos::peer_pid(stream.as_raw_fd()) else {
         return unidentified();
     };
-    let chain = mortise_macos::process_chain(pid, CHAIN_DEPTH);
+    let chain = mortise_macos::process_chain(pid, MAX_ANCESTRY);
     let Some(cwd) = chain.first().and_then(|p| p.cwd.clone()) else {
         return unidentified();
+    };
+    let lineage: Vec<ProcessKey> = chain
+        .iter()
+        .map(|p| ProcessKey {
+            pid: p.pid,
+            started_at_us: p.started_at_us,
+        })
+        .collect();
+
+    // Every decision below is logged, refusals included: a process probing
+    // for project names is exactly what someone reviewing access wants to see.
+    let mut event = AccessEvent {
+        at_ms: 0,
+        project: sanitize_display(&project, 60),
+        environment: sanitize_display(&environment, 60),
+        keys: keys.clone(),
+        command: sanitize_display(&command, 200),
+        directory: cwd.display().to_string(),
+        process_chain: describe_chain(&chain[..chain.len().min(CHAIN_SHOWN)]),
+        outcome: Outcome::Refused,
+        detail: None,
     };
 
     let state = app.state::<AppState>();
     if let Err(response) = wait_for_unlock(app, &state, stream) {
-        return response;
+        return refuse(app, event, response);
     }
 
     let checked = state.with_vault(|vault| match vault {
         Some(v) => check(v, &project, &environment, keys.as_deref()),
-        None => Err(Response::error(
-            ErrorCode::NoVault,
-            "There is no Mortise vault on this Mac yet.",
-        )),
+        None => Err(no_vault()),
     });
     let (project, environment) = match checked {
         Ok(names) => names,
-        Err(response) => return response,
+        Err(response) => return refuse(app, event, response),
     };
+    event.project = project.clone();
+    event.environment = environment.clone();
 
     let access = app.state::<CliAccess>();
-    if !access.is_granted(&project, &environment, &cwd) {
-        let summary = RequestSummary {
-            id: match new_id() {
-                Some(id) => id,
-                None => {
-                    return Response::error(ErrorCode::Internal, "Could not start the request.");
-                }
-            },
-            project: project.clone(),
-            environment: environment.clone(),
-            keys: keys.clone(),
-            command: sanitize_display(&command, 200),
-            directory: grant_root_on_disk(&cwd).display().to_string(),
-            process_chain: describe_chain(&chain),
-        };
-        if let Err(response) = ask(app, &access, stream, summary) {
-            return response;
-        }
-    }
+    let covered = match kind {
+        // A session is always asked for: it hands out access ahead of time.
+        RequestKind::Session => None,
+        RequestKind::Run => access.coverage(&project, &environment, &cwd, &lineage),
+    };
 
-    state.with_vault(|vault| match vault {
+    let outcome = match covered {
+        Some(Coverage::Directory) => Outcome::ServedByGrant,
+        Some(Coverage::Session) => Outcome::ServedBySession,
+        None => {
+            let Some(id) = new_id() else {
+                return refuse(
+                    app,
+                    event,
+                    Response::error(ErrorCode::Internal, "Could not start the request."),
+                );
+            };
+            let summary = RequestSummary {
+                id,
+                kind,
+                project: project.clone(),
+                environment: environment.clone(),
+                keys: keys.clone(),
+                command: event.command.clone(),
+                directory: match kind {
+                    RequestKind::Run => grant_root_on_disk(&cwd),
+                    RequestKind::Session => cwd.clone(),
+                }
+                .display()
+                .to_string(),
+                process_chain: event.process_chain.clone(),
+            };
+            match ask(app, &access, stream, &summary) {
+                Err((response, outcome)) => {
+                    event.outcome = outcome;
+                    return refuse(app, event, response);
+                }
+                Ok(_) if kind == RequestKind::Session => {
+                    let expires_at_ms = access.start_session(&summary, lineage[0]);
+                    event.outcome = Outcome::SessionStarted;
+                    record(app, &event);
+                    return Response::SessionStarted { expires_at_ms };
+                }
+                Ok(Answer::ForEightHours) => Outcome::AllowedForDirectory,
+                Ok(_) => Outcome::AllowedOnce,
+            }
+        }
+    };
+
+    let response = state.with_vault(|vault| match vault {
         Some(v) if v.is_unlocked() => fetch(v, &project, &environment, keys.as_deref()),
         Some(_) => Response::error(
             ErrorCode::Locked,
             "Mortise locked before the request finished. Run it again.",
         ),
-        None => Response::error(
-            ErrorCode::NoVault,
-            "There is no Mortise vault on this Mac yet.",
-        ),
-    })
+        None => no_vault(),
+    });
+    match response {
+        Response::Env { .. } => {
+            event.outcome = outcome;
+            record(app, &event);
+            response
+        }
+        other => refuse(app, event, other),
+    }
+}
+
+/// Log a refusal and pass the response through.
+fn refuse(app: &AppHandle, mut event: AccessEvent, response: Response) -> Response {
+    if let Response::Error { message, .. } = &response {
+        event.detail = Some(message.clone());
+    }
+    record(app, &event);
+    response
+}
+
+/// Append to the access log. A failure is reported but does not block the
+/// request: before the first unlock there is no key to seal the entry with,
+/// and refusing every command for want of a log line would be backwards.
+fn record(app: &AppHandle, event: &AccessEvent) {
+    let state = app.state::<AppState>();
+    let result = state.with_vault(|vault| vault.map(|v| v.record_access(event)));
+    if let Some(Err(e)) = result {
+        eprintln!("mortise: could not write the access log: {e}");
+    }
+}
+
+fn no_vault() -> Response {
+    Response::error(
+        ErrorCode::NoVault,
+        "There is no Mortise vault on this Mac yet.",
+    )
 }
 
 fn unidentified() -> Response {
@@ -173,17 +268,21 @@ fn wait_for_unlock(
 }
 
 /// Put the request in front of the user and wait for an answer.
+///
+/// On failure, also says how to log it.
 fn ask(
     app: &AppHandle,
     access: &CliAccess,
     stream: &mut UnixStream,
-    summary: RequestSummary,
-) -> Result<(), Response> {
-    let id = summary.id.clone();
-    let Some(answer) = access.enqueue(summary) else {
-        return Err(Response::error(
-            ErrorCode::Busy,
-            "Too many requests are already waiting for approval in Mortise.",
+    summary: &RequestSummary,
+) -> Result<Answer, (Response, Outcome)> {
+    let Some(answer) = access.enqueue(summary.clone()) else {
+        return Err((
+            Response::error(
+                ErrorCode::Busy,
+                "Too many requests are already waiting for approval in Mortise.",
+            ),
+            Outcome::Refused,
         ));
     };
 
@@ -195,27 +294,27 @@ fn ask(
     )
     .is_err()
     {
-        access.withdraw(&id);
-        return Err(Response::error(
-            ErrorCode::Internal,
-            "The command went away.",
+        access.withdraw(&summary.id);
+        return Err((
+            Response::error(ErrorCode::Internal, "The command went away."),
+            Outcome::Refused,
         ));
     }
     let _ = app.emit("cli-access-requested", ());
     crate::show_main_window(app);
 
     match answer.recv_timeout(USER_WAIT) {
-        Ok(Answer::Once | Answer::ForEightHours) => Ok(()),
-        Ok(Answer::Deny) => Err(Response::error(
-            ErrorCode::Denied,
-            "Access was denied in Mortise.",
+        Ok(Answer::Deny) => Err((
+            Response::error(ErrorCode::Denied, "Access was denied in Mortise."),
+            Outcome::Denied,
         )),
+        Ok(allowed) => Ok(allowed),
         Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
-            access.withdraw(&id);
+            access.withdraw(&summary.id);
             let _ = app.emit("cli-access-withdrawn", ());
-            Err(Response::error(
-                ErrorCode::Timeout,
-                "Nobody approved the request in time.",
+            Err((
+                Response::error(ErrorCode::Timeout, "Nobody approved the request in time."),
+                Outcome::TimedOut,
             ))
         }
     }

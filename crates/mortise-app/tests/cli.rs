@@ -141,3 +141,91 @@ fn nothing_is_served_from_a_locked_vault() {
         ErrorCode::Internal
     );
 }
+
+// --- agent sessions against real processes ---
+
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+use std::process::{Command, Stdio};
+
+use mortise_app_lib::cli::access::{
+    CliAccess, Coverage, ProcessKey, RequestKind, RequestSummary, process_alive,
+};
+
+fn key(pid: i32) -> ProcessKey {
+    let info = mortise_macos::process_info(pid).expect("process should exist");
+    ProcessKey {
+        pid,
+        started_at_us: info.started_at_us,
+    }
+}
+
+fn lineage(pid: i32) -> Vec<ProcessKey> {
+    mortise_macos::process_chain(pid, 64)
+        .into_iter()
+        .map(|p| ProcessKey {
+            pid: p.pid,
+            started_at_us: p.started_at_us,
+        })
+        .collect()
+}
+
+fn session_request() -> RequestSummary {
+    RequestSummary {
+        id: "s".into(),
+        kind: RequestKind::Session,
+        project: "api".into(),
+        environment: "dev".into(),
+        keys: None,
+        command: "agent".into(),
+        directory: "/".into(),
+        process_chain: Vec::new(),
+    }
+}
+
+/// An "agent" (`sh`) with a grandchild (`sleep`) standing in for a command
+/// it ran. Returns the agent and the grandchild's pid.
+fn spawn_agent() -> (std::process::Child, i32) {
+    let mut agent = Command::new("sh")
+        .args(["-c", "sleep 30 & echo $!; wait"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(agent.stdout.as_mut().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    (agent, line.trim().parse().unwrap())
+}
+
+#[test]
+fn a_session_covers_the_agents_real_descendants_and_nothing_else() {
+    let (mut agent, grandchild) = spawn_agent();
+    let root = key(agent.id() as i32);
+    let access = CliAccess::default();
+    access.start_session(&session_request(), root);
+
+    assert_eq!(
+        access.coverage("api", "dev", Path::new("/"), &lineage(grandchild)),
+        Some(Coverage::Session)
+    );
+
+    // A sibling — same parent (this test), not inside the agent.
+    let mut sibling = Command::new("sleep").arg("30").spawn().unwrap();
+    assert_eq!(
+        access.coverage("api", "dev", Path::new("/"), &lineage(sibling.id() as i32)),
+        None
+    );
+
+    let _ = sibling.kill();
+    let _ = agent.kill();
+    let _ = agent.wait();
+    let _ = sibling.wait();
+    let _ = Command::new("kill").arg(grandchild.to_string()).status();
+
+    assert!(!process_alive(root), "the agent has exited");
+    assert!(
+        access.grants(process_alive).is_empty(),
+        "so its session is gone"
+    );
+}

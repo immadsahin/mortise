@@ -1556,7 +1556,7 @@ pub fn answer_cli_request(
 pub fn list_cli_grants(
     access: State<'_, crate::cli::access::CliAccess>,
 ) -> Vec<crate::cli::access::GrantSummary> {
-    access.grants()
+    access.grants(crate::cli::access::process_alive)
 }
 
 /// End a command-line grant now.
@@ -1570,4 +1570,19 @@ pub fn revoke_cli_grant(
     } else {
         Err(CmdError::bad_request("That grant has already ended."))
     }
+}
+
+/// The most recent command-line accesses, newest first. Never values.
+#[tauri::command]
+pub fn cli_access_log(
+    state: State<'_, AppState>,
+    limit: Option<u32>,
+) -> CmdResult<Vec<mortise_vault::access_log::AccessEvent>> {
+    let limit = limit
+        .unwrap_or(100)
+        .min(mortise_vault::access_log::MAX_ENTRIES);
+    state.with_vault(|vault| {
+        let v = vault.ok_or_else(|| state.no_vault_error())?;
+        Ok(v.access_log(limit)?)
+    })
 }

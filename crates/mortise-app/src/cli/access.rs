@@ -2,8 +2,14 @@
 //!
 //! Two lists, both in memory only:
 //!
-//! - **Grants**: "anything run from this directory may read `api/dev` until
-//!   six o'clock". Created when the user picks *Allow for 8 hours*.
+//! - **Grants**, of two kinds:
+//!   - *directory*: "anything run from this directory may read `api/dev`
+//!     until six o'clock". Created by *Allow for 8 hours* on a `mortise run`.
+//!   - *agent session*: "anything this agent process runs may read
+//!     `api/dev`". Created by approving `mortise agent`. Bound to the agent's
+//!     pid **and start time**, so it cannot outlive the agent or be inherited
+//!     by whatever process is later given the same pid, and covers only
+//!     requests whose kernel-reported ancestry contains that process.
 //! - **Pending**: requests waiting for the user. Each holds the channel its
 //!   connection thread is blocked on.
 //!
@@ -31,6 +37,45 @@ pub const MAX_PENDING: usize = 4;
 /// Files that mark the top of a project for the purpose of a grant.
 const ROOT_MARKERS: [&str; 2] = [".mortise.toml", ".git"];
 
+/// A process, unambiguously: a pid is reused once its process exits, a pid
+/// with its start time is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessKey {
+    /// Process id.
+    pub pid: i32,
+    /// Start time, microseconds since the Unix epoch.
+    pub started_at_us: u64,
+}
+
+/// What a request is asking for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestKind {
+    /// `mortise run`: values now.
+    Run,
+    /// `mortise agent`: a session for the agent about to start.
+    Session,
+}
+
+/// Which kind of grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantKind {
+    /// Covers a directory tree.
+    Directory,
+    /// Covers one agent process and everything it runs.
+    Agent,
+}
+
+/// What let a request through without asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Coverage {
+    /// A directory grant.
+    Directory,
+    /// An agent session.
+    Session,
+}
+
 /// The user's answer to a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -49,6 +94,8 @@ pub enum Answer {
 pub struct RequestSummary {
     /// Opaque id for answering.
     pub id: String,
+    /// What is being asked for.
+    pub kind: RequestKind,
     /// Canonical project name.
     pub project: String,
     /// Environment.
@@ -69,6 +116,10 @@ pub struct RequestSummary {
 pub struct GrantSummary {
     /// Opaque id for revoking.
     pub id: String,
+    /// Directory grant or agent session.
+    pub kind: GrantKind,
+    /// For an agent session: what the agent said it was, and its pid.
+    pub agent: Option<String>,
     /// Canonical project name.
     pub project: String,
     /// Environment.
@@ -82,16 +133,30 @@ pub struct GrantSummary {
 
 struct Grant {
     summary: GrantSummary,
-    directory: PathBuf,
+    scope: Scope,
     expires: Instant,
 }
 
+enum Scope {
+    Directory(PathBuf),
+    Session(ProcessKey),
+}
+
 impl Grant {
-    fn covers(&self, project: &str, environment: &str, cwd: &Path, now: Instant) -> bool {
-        now < self.expires
-            && self.summary.project == project
-            && self.summary.environment == environment
-            && cwd.starts_with(&self.directory)
+    fn covers(
+        &self,
+        project: &str,
+        environment: &str,
+        cwd: &Path,
+        chain: &[ProcessKey],
+    ) -> Option<Coverage> {
+        if self.summary.project != project || self.summary.environment != environment {
+            return None;
+        }
+        match &self.scope {
+            Scope::Directory(dir) => cwd.starts_with(dir).then_some(Coverage::Directory),
+            Scope::Session(root) => chain.contains(root).then_some(Coverage::Session),
+        }
     }
 }
 
@@ -108,14 +173,27 @@ pub struct CliAccess {
 }
 
 impl CliAccess {
-    /// Whether a live grant covers this request.
-    pub fn is_granted(&self, project: &str, environment: &str, cwd: &Path) -> bool {
+    /// The grant that covers this request, if any. `chain` is the
+    /// requester's full kernel-reported ancestry, nearest first.
+    pub fn coverage(
+        &self,
+        project: &str,
+        environment: &str,
+        cwd: &Path,
+        chain: &[ProcessKey],
+    ) -> Option<Coverage> {
         let now = Instant::now();
         let mut grants = lock(&self.grants);
         grants.retain(|g| now < g.expires);
-        grants
+        // A session is the narrower statement, so it is the one reported.
+        let hits: Vec<Coverage> = grants
             .iter()
-            .any(|g| g.covers(project, environment, cwd, now))
+            .filter_map(|g| g.covers(project, environment, cwd, chain))
+            .collect();
+        hits.iter()
+            .find(|c| **c == Coverage::Session)
+            .or(hits.first())
+            .copied()
     }
 
     /// Queue a request for the user. Returns the receiver its answer will
@@ -155,7 +233,9 @@ impl CliAccess {
             return false;
         };
 
-        if answer == Answer::ForEightHours {
+        // Sessions are recorded by the connection thread, which knows the
+        // agent's pid and start time; only a directory grant is made here.
+        if answer == Answer::ForEightHours && pending.summary.kind == RequestKind::Run {
             self.add_grant(&pending.summary, GRANT_DURATION);
         }
         // A send failure means the requester hung up while waiting. The grant
@@ -166,28 +246,61 @@ impl CliAccess {
     }
 
     fn add_grant(&self, request: &RequestSummary, duration: Duration) {
+        self.push(
+            request,
+            Scope::Directory(PathBuf::from(&request.directory)),
+            duration,
+        );
+    }
+
+    /// Record an approved agent session rooted at `root`. Returns when it
+    /// expires, in Unix milliseconds.
+    pub fn start_session(&self, request: &RequestSummary, root: ProcessKey) -> u64 {
+        self.push(request, Scope::Session(root), GRANT_DURATION)
+    }
+
+    fn push(&self, request: &RequestSummary, scope: Scope, duration: Duration) -> u64 {
         let expires_at_ms = SystemTime::now()
             .checked_add(duration)
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map_or(0, |d| d.as_millis() as u64);
+        let (kind, agent) = match &scope {
+            Scope::Directory(_) => (GrantKind::Directory, None),
+            Scope::Session(root) => (
+                GrantKind::Agent,
+                Some(format!("{} (pid {})", request.command, root.pid)),
+            ),
+        };
         lock(&self.grants).push(Grant {
             summary: GrantSummary {
                 id: request.id.clone(),
+                kind,
+                agent,
                 project: request.project.clone(),
                 environment: request.environment.clone(),
                 directory: request.directory.clone(),
                 expires_at_ms,
             },
-            directory: PathBuf::from(&request.directory),
+            scope,
             expires: Instant::now() + duration,
         });
+        expires_at_ms
     }
 
     /// Live grants, soonest to expire first.
-    pub fn grants(&self) -> Vec<GrantSummary> {
+    ///
+    /// Sessions whose agent has exited are dropped here: `is_alive` asks the
+    /// kernel whether that exact process (pid and start time) still runs.
+    pub fn grants(&self, is_alive: impl Fn(ProcessKey) -> bool) -> Vec<GrantSummary> {
         let now = Instant::now();
         let mut grants = lock(&self.grants);
-        grants.retain(|g| now < g.expires);
+        grants.retain(|g| {
+            now < g.expires
+                && match g.scope {
+                    Scope::Directory(_) => true,
+                    Scope::Session(root) => is_alive(root),
+                }
+        });
         let mut out: Vec<GrantSummary> = grants.iter().map(|g| g.summary.clone()).collect();
         out.sort_by_key(|g| g.expires_at_ms);
         out
@@ -224,6 +337,11 @@ pub fn grant_root_on_disk(cwd: &Path) -> PathBuf {
     })
 }
 
+/// Whether that exact process still runs, according to the kernel.
+pub fn process_alive(key: ProcessKey) -> bool {
+    mortise_macos::process_info(key.pid).is_some_and(|p| p.started_at_us == key.started_at_us)
+}
+
 /// A poisoned lock here means a panic mid-update of a list of plain values;
 /// the data is still well-formed, so carry on rather than lock everyone out.
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -237,6 +355,7 @@ mod tests {
     fn request(id: &str, dir: &str) -> RequestSummary {
         RequestSummary {
             id: id.into(),
+            kind: RequestKind::Run,
             project: "api".into(),
             environment: "dev".into(),
             keys: None,
@@ -246,13 +365,105 @@ mod tests {
         }
     }
 
+    fn covered(access: &CliAccess, project: &str, environment: &str, cwd: &Path) -> bool {
+        access.coverage(project, environment, cwd, &[]).is_some()
+    }
+
+    const AGENT: ProcessKey = ProcessKey {
+        pid: 4242,
+        started_at_us: 1_700_000_000_000_000,
+    };
+    const SHELL: ProcessKey = ProcessKey {
+        pid: 4300,
+        started_at_us: 1_700_000_000_500_000,
+    };
+    const RUN: ProcessKey = ProcessKey {
+        pid: 4301,
+        started_at_us: 1_700_000_000_600_000,
+    };
+
+    fn session(access: &CliAccess) {
+        let mut r = request("s", "/code/api");
+        r.kind = RequestKind::Session;
+        r.command = "claude".into();
+        access.start_session(&r, AGENT);
+    }
+
+    #[test]
+    fn a_session_covers_only_requests_descending_from_that_exact_agent() {
+        let access = CliAccess::default();
+        session(&access);
+        let anywhere = Path::new("/somewhere/else");
+
+        // mortise ← sh ← claude: covered, wherever it runs from.
+        assert_eq!(
+            access.coverage("api", "dev", anywhere, &[RUN, SHELL, AGENT]),
+            Some(Coverage::Session)
+        );
+        // A process in the agent's directory but not its tree: not covered.
+        assert_eq!(
+            access.coverage("api", "dev", Path::new("/code/api"), &[RUN, SHELL]),
+            None
+        );
+        // The same pid, started later — a reused pid, not the agent.
+        let impostor = ProcessKey {
+            started_at_us: AGENT.started_at_us + 1,
+            ..AGENT
+        };
+        assert_eq!(
+            access.coverage("api", "dev", anywhere, &[RUN, impostor]),
+            None
+        );
+        // The agent's tree, but another environment.
+        assert_eq!(
+            access.coverage("api", "prod", anywhere, &[RUN, AGENT]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_session_ends_when_its_agent_exits_or_is_revoked() {
+        let access = CliAccess::default();
+        session(&access);
+        let listed = access.grants(|p| p == AGENT);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].kind, GrantKind::Agent);
+        assert_eq!(listed[0].agent.as_deref(), Some("claude (pid 4242)"));
+
+        assert!(
+            access.grants(|_| false).is_empty(),
+            "agent gone, session gone"
+        );
+        assert_eq!(
+            access.coverage("api", "dev", Path::new("/"), &[RUN, AGENT]),
+            None
+        );
+
+        session(&access);
+        assert!(access.revoke("s"));
+        assert_eq!(
+            access.coverage("api", "dev", Path::new("/"), &[RUN, AGENT]),
+            None
+        );
+    }
+
+    #[test]
+    fn approving_a_session_request_makes_no_directory_grant() {
+        let access = CliAccess::default();
+        let mut r = request("s", "/code/api");
+        r.kind = RequestKind::Session;
+        let _rx = access.enqueue(r).unwrap();
+        access.answer("s", Answer::ForEightHours);
+        assert!(!covered(&access, "api", "dev", Path::new("/code/api")));
+    }
+
     #[test]
     fn once_serves_one_request_and_leaves_no_grant() {
         let access = CliAccess::default();
         let rx = access.enqueue(request("a", "/code/api")).unwrap();
         assert!(access.answer("a", Answer::Once));
         assert_eq!(rx.recv().unwrap(), Answer::Once);
-        assert!(!access.is_granted("api", "dev", Path::new("/code/api")));
+        assert!(!covered(&access, "api", "dev", Path::new("/code/api")));
         assert!(
             !access.answer("a", Answer::Once),
             "an answered request cannot be answered again"
@@ -265,13 +476,18 @@ mod tests {
         let _rx = access.enqueue(request("a", "/code/api")).unwrap();
         access.answer("a", Answer::ForEightHours);
 
-        assert!(access.is_granted("api", "dev", Path::new("/code/api")));
-        assert!(access.is_granted("api", "dev", Path::new("/code/api/web/src")));
-        assert!(!access.is_granted("api", "prod", Path::new("/code/api")));
-        assert!(!access.is_granted("web", "dev", Path::new("/code/api")));
-        assert!(!access.is_granted("api", "dev", Path::new("/code")));
+        assert!(covered(&access, "api", "dev", Path::new("/code/api")));
+        assert!(covered(
+            &access,
+            "api",
+            "dev",
+            Path::new("/code/api/web/src")
+        ));
+        assert!(!covered(&access, "api", "prod", Path::new("/code/api")));
+        assert!(!covered(&access, "web", "dev", Path::new("/code/api")));
+        assert!(!covered(&access, "api", "dev", Path::new("/code")));
         // A sibling whose name merely starts the same way is not inside.
-        assert!(!access.is_granted("api", "dev", Path::new("/code/api-evil")));
+        assert!(!covered(&access, "api", "dev", Path::new("/code/api-evil")));
     }
 
     #[test]
@@ -281,12 +497,12 @@ mod tests {
         access.add_grant(&request("long", "/code/b"), GRANT_DURATION);
 
         assert!(
-            !access.is_granted("api", "dev", Path::new("/code/a")),
+            !covered(&access, "api", "dev", Path::new("/code/a")),
             "expired"
         );
         assert_eq!(
             access
-                .grants()
+                .grants(|_| true)
                 .iter()
                 .map(|g| g.id.as_str())
                 .collect::<Vec<_>>(),
@@ -294,7 +510,7 @@ mod tests {
         );
 
         assert!(access.revoke("long"));
-        assert!(!access.is_granted("api", "dev", Path::new("/code/b")));
+        assert!(!covered(&access, "api", "dev", Path::new("/code/b")));
         assert!(!access.revoke("long"));
     }
 
@@ -319,7 +535,7 @@ mod tests {
         let rx = access.enqueue(request("a", "/x")).unwrap();
         access.answer("a", Answer::Deny);
         assert_eq!(rx.recv().unwrap(), Answer::Deny);
-        assert!(!access.is_granted("api", "dev", Path::new("/x")));
+        assert!(!covered(&access, "api", "dev", Path::new("/x")));
     }
 
     #[test]

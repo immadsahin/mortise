@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use mortise_cli::args::{self, Command, RunArgs, USAGE};
 use mortise_cli::config;
-use mortise_cli::plan::{Fetch, Plan, Target};
-use mortise_cli::protocol::{ErrorCode, Request, Response, Var, WaitReason};
+use mortise_cli::plan::{Plan, Target};
+use mortise_cli::protocol::{ErrorCode, Request, Response, WaitReason};
 use mortise_cli::template;
 use mortise_proxy::framing::{read_frame, write_frame};
 
@@ -37,12 +37,9 @@ fn main() -> ExitCode {
             println!("mortise {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        Ok(Command::Run(run_args)) => {
-            // Only returns on failure: success replaces this process.
-            let message = run(run_args);
-            eprintln!("mortise: {}", message.text);
-            ExitCode::from(message.exit)
-        }
+        // Both only return on failure: success replaces this process.
+        Ok(Command::Run(run_args)) => fail(run(run_args)),
+        Ok(Command::Agent(agent_args)) => fail(agent(agent_args)),
         Err(message) => {
             eprintln!("mortise: {message}");
             ExitCode::from(2)
@@ -50,7 +47,12 @@ fn main() -> ExitCode {
     }
 }
 
-/// Why `run` returned instead of becoming the child.
+fn fail(failure: Failure) -> ExitCode {
+    eprintln!("mortise: {}", failure.text);
+    ExitCode::from(failure.exit)
+}
+
+/// Why `run` or `agent` returned instead of becoming the child.
 struct Failure {
     text: String,
     exit: u8,
@@ -67,20 +69,23 @@ fn run(args: RunArgs) -> Failure {
         Ok(plan) => plan,
         Err(e) => return e.into(),
     };
-
-    let socket = match std::env::var_os(SOCKET_ENV) {
-        Some(path) => PathBuf::from(path),
-        None => match mortise_proxy::app_socket_path(mortise_proxy::CLI_SOCKET) {
-            Some(path) => path,
-            None => return String::from("cannot find the Mortise socket: HOME is not set").into(),
-        },
+    let socket = match socket_path() {
+        Ok(socket) => socket,
+        Err(e) => return e.into(),
     };
 
     let preview = command_preview(&args.command);
     let mut answers = Vec::new();
     for fetch in plan.fetches() {
-        match request(&socket, &fetch, &preview) {
-            Ok(vars) => answers.push((fetch, vars)),
+        let request = Request::Env {
+            project: fetch.target.project.clone(),
+            environment: fetch.target.environment.clone(),
+            keys: fetch.keys.as_ref().map(|k| k.iter().cloned().collect()),
+            command: preview.clone(),
+        };
+        match ask_app(&socket, &request, &fetch.target) {
+            Ok(Response::Env { vars }) => answers.push((fetch, vars)),
+            Ok(_) => return unexpected().into(),
             Err(e) => return e.into(),
         }
     }
@@ -98,16 +103,57 @@ fn run(args: RunArgs) -> Failure {
         child.env(key, value.as_str());
     }
     drop(answers);
+    become_child(child, &args.command[0])
+}
 
-    // Replace this process rather than supervising a child: signals, exit
-    // status, the terminal and job control all behave exactly as if the
-    // command had been run directly, with nothing in between to get wrong.
+/// Start an agent session for this process, then become the agent.
+///
+/// The app binds the session to *this* pid and start time. `exec` keeps
+/// both, so the agent inherits the session and nothing else can claim it.
+fn agent(args: RunArgs) -> Failure {
+    let plan = match build_plan(&args) {
+        Ok(plan) => plan,
+        Err(e) => return e.into(),
+    };
+    let Some(target) = plan.whole else {
+        return String::from("an agent session needs --project and --env (or a .mortise.toml)")
+            .into();
+    };
+    let socket = match socket_path() {
+        Ok(socket) => socket,
+        Err(e) => return e.into(),
+    };
+
+    let request = Request::StartSession {
+        project: target.project.clone(),
+        environment: target.environment.clone(),
+        command: command_preview(&args.command),
+    };
+    match ask_app(&socket, &request, &target) {
+        Ok(Response::SessionStarted { .. }) => {
+            eprintln!(
+                "mortise: session started for {}/{}. Prefix commands with `mortise run --` to use it.",
+                target.project, target.environment
+            );
+        }
+        Ok(_) => return unexpected().into(),
+        Err(e) => return e.into(),
+    }
+
+    let mut child = std::process::Command::new(&args.command[0]);
+    child.args(&args.command[1..]);
+    become_child(child, &args.command[0])
+}
+
+/// Replace this process with `child`.
+///
+/// Rather than supervising it: signals, exit status, the terminal and job
+/// control all behave exactly as if the command had been run directly, with
+/// nothing in between to get wrong. Only returns on failure.
+fn become_child(mut child: std::process::Command, program: &std::ffi::OsStr) -> Failure {
     let err = child.exec();
     Failure {
-        text: format!(
-            "could not run `{}`: {err}",
-            args.command[0].to_string_lossy()
-        ),
+        text: format!("could not run `{}`: {err}", program.to_string_lossy()),
         // The shell's conventions: 127 not found, 126 found but not runnable.
         exit: if err.kind() == std::io::ErrorKind::NotFound {
             127
@@ -115,6 +161,19 @@ fn run(args: RunArgs) -> Failure {
             126
         },
     }
+}
+
+fn socket_path() -> Result<PathBuf, String> {
+    match std::env::var_os(SOCKET_ENV) {
+        Some(path) => Ok(PathBuf::from(path)),
+        None => mortise_proxy::app_socket_path(mortise_proxy::CLI_SOCKET)
+            .ok_or_else(|| "cannot find the Mortise socket: HOME is not set".to_string()),
+    }
+}
+
+fn unexpected() -> String {
+    "Mortise answered with something this version does not expect. Update the mortise command."
+        .into()
 }
 
 /// Flags, then `.mortise.toml` for whatever the flags left out.
@@ -161,24 +220,23 @@ fn build_plan(args: &RunArgs) -> Result<Plan, String> {
     Ok(plan)
 }
 
-/// Ask the app for one environment.
-fn request(socket: &std::path::Path, fetch: &Fetch, command: &str) -> Result<Vec<Var>, String> {
+/// Send one request and wait through any `Waiting` frames for the answer.
+/// Errors come back as the message to show.
+fn ask_app(
+    socket: &std::path::Path,
+    request: &Request,
+    target: &Target,
+) -> Result<Response, String> {
     let mut stream = UnixStream::connect(socket)
         .map_err(|_| "Mortise is not running. Open it and try again.".to_string())?;
     stream
         .set_read_timeout(Some(READ_TIMEOUT))
         .map_err(|e| e.to_string())?;
 
-    let req = Request::Env {
-        project: fetch.target.project.clone(),
-        environment: fetch.target.environment.clone(),
-        keys: fetch.keys.as_ref().map(|k| k.iter().cloned().collect()),
-        command: command.to_string(),
-    };
-    let body = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
+    let body = serde_json::to_vec(request).map_err(|e| e.to_string())?;
     write_frame(&mut stream, &body).map_err(|e| format!("could not reach Mortise: {e}"))?;
 
-    let label = format!("{}/{}", fetch.target.project, fetch.target.environment);
+    let label = format!("{}/{}", target.project, target.environment);
     loop {
         let frame = match read_frame(&mut stream) {
             Ok(Some(frame)) => frame,
@@ -193,8 +251,7 @@ fn request(socket: &std::path::Path, fetch: &Fetch, command: &str) -> Result<Vec
             }
             Err(e) => return Err(format!("could not read Mortise's answer: {e}")),
         };
-        let response: Response = serde_json::from_slice(&frame)
-            .map_err(|_| "Mortise sent an answer this version does not understand. Update the mortise command.".to_string())?;
+        let response: Response = serde_json::from_slice(&frame).map_err(|_| unexpected())?;
         match response {
             Response::Waiting {
                 reason: WaitReason::Unlock,
@@ -206,13 +263,13 @@ fn request(socket: &std::path::Path, fetch: &Fetch, command: &str) -> Result<Vec
             } => {
                 eprintln!("mortise: approve access to {label} in the Mortise window…");
             }
-            Response::Env { vars } => return Ok(vars),
             Response::Error { code, message } => {
                 return Err(match code {
                     ErrorCode::Other => format!("{label}: {message}"),
                     _ => message,
                 });
             }
+            answer => return Ok(answer),
         }
     }
 }
