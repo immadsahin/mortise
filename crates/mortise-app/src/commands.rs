@@ -1517,3 +1517,57 @@ fn sync_error(e: mortise_sync::Error) -> CmdError {
         }
     }
 }
+
+/// The oldest command-line request waiting for approval, if any.
+#[tauri::command]
+pub fn pending_cli_request(
+    access: State<'_, crate::cli::access::CliAccess>,
+) -> Option<crate::cli::access::RequestSummary> {
+    access.next_pending()
+}
+
+/// Answer a command-line request.
+///
+/// Like browser pairing, only a click in this window can approve: the
+/// request itself comes from a local process the app does not trust.
+#[tauri::command]
+pub fn answer_cli_request(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    access: State<'_, crate::cli::access::CliAccess>,
+    id: String,
+    answer: crate::cli::access::Answer,
+) -> CmdResult<()> {
+    use tauri::Emitter;
+
+    state.touch();
+    if access.answer(&id, answer) {
+        let _ = app.emit("cli-access-answered", ());
+        Ok(())
+    } else {
+        Err(CmdError::bad_request(
+            "That request is no longer waiting. Run the command again.",
+        ))
+    }
+}
+
+/// Live command-line grants.
+#[tauri::command]
+pub fn list_cli_grants(
+    access: State<'_, crate::cli::access::CliAccess>,
+) -> Vec<crate::cli::access::GrantSummary> {
+    access.grants()
+}
+
+/// End a command-line grant now.
+#[tauri::command]
+pub fn revoke_cli_grant(
+    access: State<'_, crate::cli::access::CliAccess>,
+    id: String,
+) -> CmdResult<()> {
+    if access.revoke(&id) {
+        Ok(())
+    } else {
+        Err(CmdError::bad_request("That grant has already ended."))
+    }
+}

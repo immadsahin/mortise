@@ -9,6 +9,7 @@
 
 mod accounts;
 pub mod browser;
+pub mod cli;
 pub mod commands;
 pub mod dto;
 pub mod error;
@@ -56,6 +57,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(invitations::IncomingInvite::default())
         .manage(accounts::AccountState::default())
+        .manage(cli::access::CliAccess::default())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -105,6 +107,11 @@ pub fn run() {
             match browser::server::start(app.handle()) {
                 Ok(path) => eprintln!("mortise: browser socket at {}", path.display()),
                 Err(e) => eprintln!("mortise: browser autofill unavailable: {e}"),
+            }
+            // Same reasoning: the command line is optional.
+            match cli::server::start(app.handle()) {
+                Ok(path) => eprintln!("mortise: command-line socket at {}", path.display()),
+                Err(e) => eprintln!("mortise: command line unavailable: {e}"),
             }
 
             Ok(())
@@ -161,6 +168,10 @@ pub fn run() {
             commands::complete_project_join,
             commands::take_project_invite,
             commands::touch,
+            commands::pending_cli_request,
+            commands::answer_cli_request,
+            commands::list_cli_grants,
+            commands::revoke_cli_grant,
         ])
         .build(tauri::generate_context!())
         .expect("failed to start Mortise")
