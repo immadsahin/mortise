@@ -66,6 +66,36 @@ be revoked. Grants are held in memory only: quitting Mortise ends them all.
 If the vault is locked, the command waits (up to two minutes) while you
 unlock. Unanswered approvals time out after two minutes as well.
 
+## Agent sessions
+
+A directory grant covers every process run from that directory. To give one
+agent access — and nothing else on the machine — start it through Mortise:
+
+```bash
+mortise agent --project api --env dev -- claude
+```
+
+The app asks once ("Start an agent session…?"). If you approve, `mortise`
+becomes the agent (`exec`, same pid), and the session is bound to that exact
+process: its pid **and start time**, as the kernel reports them. From then
+on, a `mortise run` is served without a prompt only if the agent is among its
+kernel-reported ancestors — `mortise ← sh ← claude` is covered; a process in
+the same directory that the agent did not start is not, and neither is a
+later process that happens to get the same pid.
+
+The session ends when the agent exits, after 8 hours, or when you revoke it
+in Settings. Nothing is put in the agent's own environment: tell it to prefix
+commands with `mortise run --` (for example in `CLAUDE.md`), so values reach
+only the commands that need them and not the agent's context.
+
+## Access log
+
+Every decision — allowed, served by a grant or session, denied, timed out or
+refused — is recorded under **Settings → Command line → Recent access**: when,
+which project and environment, which keys (never values), the process chain
+and the claimed command. The log is sealed in the vault like search metadata,
+kept on this Mac only (never synced), and capped at the newest 1,000 entries.
+
 ## Failures
 
 Nothing runs unless every requested value was delivered. A missing project,
@@ -78,9 +108,9 @@ a command that cannot be found exits 127, like a shell.
 - Personal-vault projects only. Projects shared with a team live in separate
   vault files that normal project operations do not route to yet
   (see `product-readiness.md`, gap 1).
-- A grant is per directory, not per agent: once approved for 8 hours, any
-  process run from that directory can use it. Use *Allow once* when that
-  matters.
+- A directory grant covers any process run from that directory, including
+  one that changes into it first. Use an agent session, or *Allow once*,
+  when that matters.
 - Requests do not count as activity, so the normal idle auto-lock still
   applies; a long-lived agent will hit the unlock prompt after it.
 - The child process can read its own environment. Injection keeps secrets

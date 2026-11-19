@@ -173,8 +173,15 @@ command is shown as a claim. Approvals are per request or per directory tree
 for at most eight hours, held in memory only, listed and revocable in
 Settings. The pending queue is capped so a process cannot bury the user in
 prompts. Unknown projects are refused without listing the real ones.
-**Residual:** a grant covers every process run from its directory, not one
-agent. A process can `chdir` into a granted directory before asking. A user
+Agent sessions narrow this further: a session is bound to one process by pid
+and start time, and covers only requests whose kernel-reported ancestry
+contains that process, so neither a process elsewhere in the directory nor a
+later holder of a reused pid inherits it. Every decision is written to a
+sealed, local-only access log for review.
+**Residual:** a *directory* grant covers every process run from its
+directory; a process can `chdir` into one before asking. Anything an agent
+session's agent runs is covered, including code the agent was tricked into
+running. A user
 who clicks Allow without reading has let that process in. Values handed to a
 child process are readable by that process and anything it spawns. Pid reuse
 between connect and lookup could misattribute a request; it requires the
