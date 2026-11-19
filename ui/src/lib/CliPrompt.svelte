@@ -56,26 +56,44 @@
 
 {#if request}
   <SecurityDialog label="Command-line access">
-    <h2>Let a command read {request.project} / {request.environment}?</h2>
-    <p>It is asking for {what} from that environment.</p>
+    {#if request.kind === "session"}
+      <h2>Start an agent session for {request.project} / {request.environment}?</h2>
+      <p>
+        Until the agent exits, or for 8 hours, anything it runs with
+        <code>mortise run</code> can read every secret in that environment
+        without asking. Nothing outside the agent is covered, even in the same
+        directory.
+      </p>
+    {:else}
+      <h2>Let a command read {request.project} / {request.environment}?</h2>
+      <p>It is asking for {what} from that environment.</p>
+    {/if}
     <dl>
       <dt>Directory</dt>
       <dd><code>{request.directory}</code></dd>
       <dt>Started by</dt>
       <dd><code>{request.process_chain.join(" ← ")}</code></dd>
-      <dt>Says it will run</dt>
+      <dt>{request.kind === "session" ? "Says the agent is" : "Says it will run"}</dt>
       <dd><code>{request.command || "—"}</code></dd>
     </dl>
-    <p class="faint">
-      Allow this only if you just ran it yourself, or asked an agent to.
-      “For 8 hours” covers anything run from that directory until then, or
-      until you revoke it in Settings.
-    </p>
+    {#if request.kind === "session"}
+      <p class="faint">Start this only if you just launched that agent with <code>mortise agent</code>.</p>
+    {:else}
+      <p class="faint">
+        Allow this only if you just ran it yourself, or asked an agent to.
+        “For 8 hours” covers anything run from that directory until then, or
+        until you revoke it in Settings.
+      </p>
+    {/if}
     {#if error}<p class="err">{error}</p>{/if}
     <div class="row">
       <button disabled={busy} onclick={() => answer("deny")}>Deny</button>
-      <button disabled={busy} onclick={() => answer("for_eight_hours")}>Allow for 8 hours</button>
-      <button class="primary" disabled={busy} onclick={() => answer("once")}>Allow once</button>
+      {#if request.kind === "session"}
+        <button class="primary" disabled={busy} onclick={() => answer("for_eight_hours")}>Start session</button>
+      {:else}
+        <button disabled={busy} onclick={() => answer("for_eight_hours")}>Allow for 8 hours</button>
+        <button class="primary" disabled={busy} onclick={() => answer("once")}>Allow once</button>
+      {/if}
     </div>
   </SecurityDialog>
 {/if}

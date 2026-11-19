@@ -125,6 +125,8 @@ export interface NativeHostStatus {
  *  from the kernel; `command` is the client's own claim. */
 export interface CliRequest {
   id: string;
+  /** `run`: values now. `session`: an agent about to start. */
+  kind: "run" | "session";
   project: string;
   environment: string;
   /** Specific keys, or null for the whole environment. */
@@ -140,10 +142,31 @@ export type CliAnswer = "deny" | "once" | "for_eight_hours";
 /** A live command-line grant. */
 export interface CliGrant {
   id: string;
+  kind: "directory" | "agent";
+  /** For an agent session: the agent and its pid. */
+  agent: string | null;
   project: string;
   environment: string;
   directory: string;
   expires_at_ms: number;
+}
+
+export type CliOutcome =
+  | "allowed_once" | "allowed_for_directory" | "served_by_grant"
+  | "session_started" | "served_by_session"
+  | "denied" | "timed_out" | "refused";
+
+/** One logged command-line access. Never contains a value. */
+export interface CliAccessEvent {
+  at_ms: number;
+  project: string;
+  environment: string;
+  keys: string[] | null;
+  command: string;
+  directory: string;
+  process_chain: string[];
+  outcome: CliOutcome;
+  detail: string | null;
 }
 
 export interface PairedBrowser {

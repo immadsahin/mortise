@@ -17,7 +17,7 @@ import type {
   EnvImportReport,
   EnvCopyReport,
   AccountStatus, AccountAction,
-  CliAnswer, CliGrant, CliRequest,
+  CliAccessEvent, CliAnswer, CliGrant, CliRequest,
 } from "./types";
 
 const IN_TAURI = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -102,6 +102,7 @@ export const ipc = {
     call<void>("answer_cli_request", { id, answer }),
   listCliGrants: () => call<CliGrant[]>("list_cli_grants"),
   revokeCliGrant: (id: string) => call<void>("revoke_cli_grant", { id }),
+  cliAccessLog: (limit?: number) => call<CliAccessEvent[]>("cli_access_log", { limit }),
 };
 
 /** Fires when the command-line queue changes: a request arrived, was
@@ -227,9 +228,22 @@ const mockState = {
   rows: [...MOCK_ROWS],
   browsers: [] as PairedBrowser[],
   cliGrants: [{
-    id: "g1", project: "acme-api", environment: "dev",
+    id: "g1", kind: "directory", agent: null, project: "acme-api", environment: "dev",
+    directory: "/Users/you/code/acme-api", expires_at_ms: Date.now() + 8 * 3600_000,
+  }, {
+    id: "g2", kind: "agent", agent: "claude (pid 4242)", project: "acme-api", environment: "dev",
     directory: "/Users/you/code/acme-api", expires_at_ms: Date.now() + 8 * 3600_000,
   }] as CliGrant[],
+  cliLog: [{
+    at_ms: Date.now() - 60_000, project: "acme-api", environment: "dev", keys: null,
+    command: "npm run dev", directory: "/Users/you/code/acme-api",
+    process_chain: ["/usr/local/bin/mortise", "sh", "claude"], outcome: "served_by_session", detail: null,
+  }, {
+    at_ms: Date.now() - 300_000, project: "payroll", environment: "prod", keys: null,
+    command: "curl …", directory: "/tmp",
+    process_chain: ["/usr/local/bin/mortise", "bash"], outcome: "refused",
+    detail: "There is no project called “payroll” in Mortise.",
+  }] as CliAccessEvent[],
   nativeHost: null as string | null,
   relayUrl: null as string | null,
   projects: [
@@ -322,6 +336,8 @@ async function mock<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
     }
     case "list_cli_grants":
       return as(mockState.cliGrants);
+    case "cli_access_log":
+      return as(mockState.cliLog);
     case "revoke_cli_grant":
       mockState.cliGrants = mockState.cliGrants.filter((g) => g.id !== args.id);
       return as(undefined);
