@@ -41,3 +41,12 @@ fn the_chain_walks_up_to_the_parent() {
 fn an_unconnected_fd_is_unidentified() {
     assert_eq!(mortise_macos::peer_pid(-1), None);
 }
+
+#[test]
+fn a_process_has_a_stable_start_time() {
+    let pid = std::process::id() as i32;
+    let a = mortise_macos::process_info(pid).unwrap().started_at_us;
+    let b = mortise_macos::process_info(pid).unwrap().started_at_us;
+    assert!(a > 1_600_000_000_000_000, "a plausible recent time: {a}");
+    assert_eq!(a, b);
+}

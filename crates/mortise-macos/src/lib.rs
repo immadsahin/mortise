@@ -50,6 +50,11 @@ pub struct ProcessInfo {
     pub executable: Option<std::path::PathBuf>,
     /// Current working directory.
     pub cwd: Option<std::path::PathBuf>,
+    /// When the process started, in microseconds since the Unix epoch.
+    ///
+    /// A pid alone does not name a process for long: once it exits, the
+    /// number is reused. Pid plus start time does.
+    pub started_at_us: u64,
 }
 
 /// `pid` and up to `depth` of its ancestors, nearest first.

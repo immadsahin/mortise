@@ -46,6 +46,10 @@ pub fn process_info(pid: i32) -> Option<ProcessInfo> {
         parent_pid: i32::try_from(bsd.pbi_ppid).ok().filter(|p| *p > 0),
         executable: executable(pid),
         cwd: cwd(pid),
+        started_at_us: bsd
+            .pbi_start_tvsec
+            .saturating_mul(1_000_000)
+            .saturating_add(bsd.pbi_start_tvusec),
     })
 }
 
