@@ -14,6 +14,7 @@ pub mod dto;
 pub mod error;
 pub mod invitations;
 pub mod keys;
+mod local_socket;
 pub mod rebrand;
 pub mod state;
 
@@ -38,6 +39,17 @@ pub const KEYCHAIN_SERVICE: &str = match option_env!("MORTISE_DEV_APP_ID") {
     Some(id) => id,
     None => "com.mortise.desktop",
 };
+
+/// Bring the main window forward, for something that needs the user now:
+/// an invite link that was opened, or a command waiting for unlock or
+/// approval.
+pub(crate) fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
 
 /// Build and run the app.
 pub fn run() {
@@ -163,11 +175,7 @@ pub fn run() {
                     {
                         // Signal only; the link is drained through the narrow IPC command.
                         let _ = app.emit_to("main", "project-invite-opened", ());
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.unminimize();
-                            let _ = window.set_focus();
-                        }
+                        show_main_window(app);
                         break;
                     }
                 }
