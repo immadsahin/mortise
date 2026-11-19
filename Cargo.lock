@@ -2721,6 +2721,7 @@ version = "0.1.0"
 dependencies = [
  "core-foundation",
  "core-foundation-sys",
+ "libc",
  "security-framework-sys",
  "thiserror 2.0.21",
  "zeroize",
