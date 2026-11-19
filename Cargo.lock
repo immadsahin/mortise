@@ -2694,6 +2694,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mortise-cli"
+version = "0.1.0"
+dependencies = [
+ "mortise-proxy",
+ "mortise-vault",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml 0.8.2",
+ "zeroize",
+]
+
+[[package]]
 name = "mortise-crypto"
 version = "0.1.0"
 dependencies = [
