@@ -454,11 +454,9 @@ pub fn import_env(
                 folder: Some(format!("{project}/{environment}")),
                 project: Some(project.clone()),
                 environment: Some(environment.clone()),
-                tags: Vec::new(),
-            };
+                tags: Vec::new(), ..Default::default() };
             let payload = mortise_vault::ItemPayload::EnvSecret {
-                value: var.value.clone(),
-            };
+                value: var.value.clone(), previous: None };
 
             match here.get(&var.key) {
                 Some(&id) => {
@@ -466,7 +464,7 @@ pub fn import_env(
                     // the sync traffic, to what actually changed.
                     let same = matches!(
                         v.reveal(id)?,
-                        mortise_vault::ItemPayload::EnvSecret { ref value } if *value == var.value
+                        mortise_vault::ItemPayload::EnvSecret { ref value, .. } if *value == var.value
                     );
                     if same {
                         report.unchanged += 1;
@@ -748,7 +746,7 @@ fn field_of(payload: &ItemPayload, field: &str) -> Option<Zeroizing<String>> {
         (ItemPayload::Login { notes, .. }, "notes") => notes.clone()?,
         (ItemPayload::SecureNote { body }, "body") => body.clone(),
         (ItemPayload::ApiKey { key, .. }, "key") => key.clone(),
-        (ItemPayload::EnvSecret { value }, "value") => value.clone(),
+        (ItemPayload::EnvSecret { value, .. }, "value") => value.clone(),
         (ItemPayload::Card { number, .. }, "number") => number.clone(),
         (ItemPayload::Card { cvv, .. }, "cvv") => cvv.clone(),
         _ => return None,
@@ -821,6 +819,7 @@ pub fn save_capture(state: State<'_, AppState>, title: Option<String>) -> CmdRes
         tags: Vec::new(),
         project: None,
         environment: None,
+        ..Default::default()
     };
     let payload = mortise_vault::ItemPayload::Login {
         password: capture.password.to_string(),
@@ -1145,7 +1144,7 @@ pub async fn create_project_invite(
                 .collect();
             for row in &rows {
                 let payload = account.reveal(row.id)?;
-                if let mortise_vault::ItemPayload::EnvSecret { value } = &payload {
+                if let mortise_vault::ItemPayload::EnvSecret { value, .. } = &payload {
                     shared.upsert_project_env_secret(
                         row.meta.environment.as_deref().unwrap_or("dev"),
                         &row.meta.title,

@@ -23,6 +23,7 @@ pub mod model;
 pub mod origin;
 pub mod project_share;
 pub mod projects;
+pub mod rotation;
 pub mod schema;
 pub mod vault;
 

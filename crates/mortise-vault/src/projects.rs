@@ -229,7 +229,7 @@ impl Vault {
             // Bound then matched by reference: ItemPayload is ZeroizeOnDrop,
             // so a field cannot be moved out of a temporary.
             let payload = self.reveal(row.id)?;
-            if let ItemPayload::EnvSecret { value } = &payload {
+            if let ItemPayload::EnvSecret { value, .. } = &payload {
                 vars.push(EnvVar {
                     key: row.meta.title,
                     value: value.clone(),

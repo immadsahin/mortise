@@ -55,6 +55,7 @@ fn login(title: &str) -> (ItemMeta, ItemPayload) {
             tags: vec!["devtools-zqx".into()],
             project: None,
             environment: None,
+            ..Default::default()
         },
         ItemPayload::Login {
             password: "s3cr3t-p4ssw0rd-value".into(),
@@ -62,6 +63,16 @@ fn login(title: &str) -> (ItemMeta, ItemPayload) {
             notes: None,
         },
     )
+}
+
+/// Metadata as a caller set it: without the rotation fields the vault
+/// maintains itself, so round-trip checks compare like with like.
+fn as_written(meta: ItemMeta) -> ItemMeta {
+    ItemMeta {
+        rotated_at_ms: None,
+        previous_until_ms: None,
+        ..meta
+    }
 }
 
 /// Every byte written to disk, across the db and its WAL/shm sidecars.
@@ -99,7 +110,7 @@ fn reopening_from_disk_starts_locked_and_unlocks() {
     assert!(!f.vault.is_unlocked());
     f.unlock();
     assert!(f.vault.is_unlocked());
-    assert_eq!(f.vault.item_meta(id).unwrap(), meta);
+    assert_eq!(as_written(f.vault.item_meta(id).unwrap()), meta);
 }
 
 #[test]
@@ -169,7 +180,7 @@ fn an_item_round_trips() {
     let (meta, payload) = login("GitHub");
     let id = f.vault.create_item(&meta, &payload).unwrap();
 
-    assert_eq!(f.vault.item_meta(id).unwrap(), meta);
+    assert_eq!(as_written(f.vault.item_meta(id).unwrap()), meta);
     assert_eq!(f.vault.reveal(id).unwrap(), payload);
 }
 
@@ -189,7 +200,7 @@ fn updating_bumps_the_version_and_keeps_the_creation_time() {
     };
     f.vault.update_item(id, &meta2, &payload2).unwrap();
 
-    assert_eq!(f.vault.item_meta(id).unwrap(), meta2);
+    assert_eq!(as_written(f.vault.item_meta(id).unwrap()), meta2);
     assert_eq!(f.vault.reveal(id).unwrap(), payload2);
     assert!(f.vault.list().unwrap()[0].updated_at_ms >= created);
     assert_eq!(f.vault.item_count().unwrap(), 1);
@@ -247,9 +258,11 @@ fn every_payload_kind_round_trips() {
         ItemPayload::ApiKey {
             key: "sk-ant-api03-not-a-real-key".into(),
             notes: None,
+            previous: None,
         },
         ItemPayload::EnvSecret {
             value: "postgres://localhost/db".into(),
+            previous: None,
         },
         // Spec §10's reserved slot, exercised so the shape is actually fixed.
         ItemPayload::Passkey {
@@ -653,6 +666,7 @@ fn a_project_holding_secrets_will_not_be_deleted() {
             &meta,
             &ItemPayload::EnvSecret {
                 value: "postgres://x".into(),
+                previous: None,
             },
         )
         .unwrap();
@@ -713,6 +727,7 @@ fn env_secret(project: &str, environment: &str, key: &str, value: &str) -> (Item
         },
         ItemPayload::EnvSecret {
             value: value.into(),
+            previous: None,
         },
     )
 }
@@ -841,4 +856,175 @@ fn the_access_log_keeps_only_the_newest_entries() {
     assert_eq!(log.len() as u32, MAX_ENTRIES);
     assert_eq!(log[0].project, format!("p{MAX_ENTRIES}"), "newest kept");
     assert!(log.iter().all(|e| e.project != "p0"), "oldest dropped");
+}
+
+// --- rotation ---
+
+fn api_key(key: &str) -> ItemPayload {
+    ItemPayload::ApiKey {
+        key: key.into(),
+        notes: None,
+        previous: None,
+    }
+}
+
+fn key_meta() -> ItemMeta {
+    ItemMeta {
+        title: "Stripe".into(),
+        rotate_every_days: Some(90),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn only_a_changed_value_counts_as_a_rotation_and_the_old_value_is_restorable() {
+    let mut f = Fixture::new();
+    let id = f
+        .vault
+        .create_item(&key_meta(), &api_key("sk_old"))
+        .unwrap();
+    let created = f.vault.item_meta(id).unwrap().rotated_at_ms.unwrap();
+
+    // Renaming is not rotating.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let renamed = ItemMeta {
+        title: "Stripe live".into(),
+        ..key_meta()
+    };
+    f.vault
+        .update_item(id, &renamed, &api_key("sk_old"))
+        .unwrap();
+    assert_eq!(f.vault.item_meta(id).unwrap().rotated_at_ms, Some(created));
+    assert_eq!(f.vault.reveal(id).unwrap().previous(), None);
+
+    // A new value is. The caller's payload carries no previous value, as the
+    // webview's never does; the vault keeps it anyway.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    f.vault
+        .update_item(id, &renamed, &api_key("sk_new"))
+        .unwrap();
+    let meta = f.vault.item_meta(id).unwrap();
+    assert!(meta.rotated_at_ms.unwrap() > created);
+    let payload = f.vault.reveal(id).unwrap();
+    assert_eq!(payload.primary_secret(), Some("sk_new"));
+    assert_eq!(payload.previous().unwrap().value, "sk_old");
+    assert_eq!(
+        meta.previous_until_ms,
+        Some(payload.previous().unwrap().until_ms)
+    );
+
+    // A later metadata-only save from the webview (no previous in its
+    // payload) must not drop the restore window.
+    f.vault
+        .update_item(id, &key_meta(), &api_key("sk_new"))
+        .unwrap();
+    assert_eq!(
+        f.vault.reveal(id).unwrap().previous().unwrap().value,
+        "sk_old"
+    );
+
+    // What leaves for the webview has no previous value in it.
+    assert_eq!(
+        f.vault.reveal(id).unwrap().without_previous().previous(),
+        None
+    );
+}
+
+#[test]
+fn restoring_swaps_values_and_keeps_the_restored_values_age() {
+    let mut f = Fixture::new();
+    let id = f
+        .vault
+        .create_item(&key_meta(), &api_key("sk_old"))
+        .unwrap();
+    let old_rotated = f.vault.item_meta(id).unwrap().rotated_at_ms;
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    f.vault
+        .update_item(id, &key_meta(), &api_key("sk_new"))
+        .unwrap();
+
+    f.vault.restore_previous(id).unwrap();
+    let payload = f.vault.reveal(id).unwrap();
+    assert_eq!(payload.primary_secret(), Some("sk_old"));
+    assert_eq!(
+        payload.previous().unwrap().value,
+        "sk_new",
+        "restoring is itself undoable"
+    );
+    assert_eq!(
+        f.vault.item_meta(id).unwrap().rotated_at_ms,
+        old_rotated,
+        "an old key does not look fresh"
+    );
+
+    // Undo the undo.
+    f.vault.restore_previous(id).unwrap();
+    assert_eq!(f.vault.reveal(id).unwrap().primary_secret(), Some("sk_new"));
+}
+
+#[test]
+fn expired_previous_values_are_wiped_from_the_file() {
+    let mut f = Fixture::new();
+    let id = f
+        .vault
+        .create_item(&key_meta(), &api_key("sk_live_first_value_xyz"))
+        .unwrap();
+    f.vault
+        .update_item(id, &key_meta(), &api_key("sk_live_second_value"))
+        .unwrap();
+    let until = f.vault.item_meta(id).unwrap().previous_until_ms.unwrap();
+
+    assert_eq!(
+        f.vault.purge_expired_previous_at(until - 1).unwrap(),
+        0,
+        "not yet"
+    );
+    assert_eq!(f.vault.purge_expired_previous_at(until).unwrap(), 1);
+    assert_eq!(f.vault.reveal(id).unwrap().previous(), None);
+    assert_eq!(f.vault.item_meta(id).unwrap().previous_until_ms, None);
+    assert!(
+        f.vault.restore_previous(id).is_err(),
+        "nothing left to restore"
+    );
+    assert_eq!(
+        f.vault.reveal(id).unwrap().primary_secret(),
+        Some("sk_live_second_value")
+    );
+}
+
+#[test]
+fn an_env_reimport_with_a_new_value_is_a_rotation() {
+    let mut f = Fixture::new();
+    let id = f
+        .vault
+        .upsert_project_env_secret("dev", "TOKEN", "t1")
+        .unwrap();
+    f.vault
+        .upsert_project_env_secret("dev", "TOKEN", "t1")
+        .unwrap();
+    assert_eq!(
+        f.vault.reveal(id).unwrap().previous(),
+        None,
+        "same value, no rotation"
+    );
+    f.vault
+        .upsert_project_env_secret("dev", "TOKEN", "t2")
+        .unwrap();
+    assert_eq!(f.vault.reveal(id).unwrap().previous().unwrap().value, "t1");
+}
+
+#[test]
+fn logins_track_rotation_without_keeping_old_passwords() {
+    let mut f = Fixture::new();
+    let (meta, payload) = login("GitHub");
+    let id = f.vault.create_item(&meta, &payload).unwrap();
+    let changed = ItemPayload::Login {
+        password: "new-password".into(),
+        totp_seed: None,
+        notes: None,
+    };
+    f.vault.update_item(id, &meta, &changed).unwrap();
+    assert!(f.vault.item_meta(id).unwrap().rotated_at_ms.is_some());
+    assert_eq!(f.vault.reveal(id).unwrap().previous(), None);
+    assert!(f.vault.restore_previous(id).is_err());
 }

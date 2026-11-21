@@ -170,6 +170,9 @@ pub struct MetaInput {
     /// Environment within that project.
     #[serde(default)]
     pub environment: Option<String>,
+    /// Rotation policy in days, or none.
+    #[serde(default)]
+    pub rotate_every_days: Option<u32>,
 }
 
 impl From<MetaInput> for ItemMeta {
@@ -190,6 +193,11 @@ impl From<MetaInput> for ItemMeta {
                 .into_iter()
                 .filter(|t| !t.trim().is_empty())
                 .collect(),
+            // Zero would mean "always overdue"; treat it as no policy.
+            rotate_every_days: m.rotate_every_days.filter(|d| *d > 0),
+            // Maintained by the vault; anything sent here is replaced.
+            rotated_at_ms: None,
+            previous_until_ms: None,
         }
     }
 }

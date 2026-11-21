@@ -33,6 +33,7 @@ fn vault() -> (tempfile::TempDir, Vault) {
             &meta,
             &ItemPayload::EnvSecret {
                 value: value.into(),
+                previous: None,
             },
         )
         .unwrap();
