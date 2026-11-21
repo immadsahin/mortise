@@ -45,6 +45,7 @@ export const ipc = {
   signOut: () => call<VaultStatus>("sign_out"),
   search: (query: string) => call<ItemRow[]>("search", { query }),
   reveal: (id: string) => call<ItemPayload>("reveal", { id }),
+  restorePrevious: (id: string) => call<void>("restore_previous", { id }),
   saveItem: (id: string | null, meta: MetaInput, payload: ItemPayload) =>
     call<string>("save_item", { id, meta, payload }),
   deleteItem: (id: string) => call<void>("delete_item", { id }),
@@ -182,13 +183,24 @@ const row = (
   environment: null,
   tags: [],
   updated_at_ms: Date.now() - 3_600_000,
+  rotate_every_days: null,
+  rotated_at_ms: Date.now() - 3_600_000,
+  rotation_due_at_ms: null,
+  overdue: false,
+  previous_until_ms: null,
   ...extra,
 });
 
 const MOCK_ROWS: ItemRow[] = [
   row("a", "login", "GitHub", { username: "octocat", urls: ["https://github.com"], folder: "Work", tags: ["dev"] }),
   row("b", "login", "Fastmail", { username: "me@fastmail.com", urls: ["https://app.fastmail.com"], folder: "Personal" }),
-  row("c", "apikey", "Anthropic API", { urls: ["https://console.anthropic.com"], folder: "Work", tags: ["ai"] }),
+  // Overdue for rotation, with the previous key still restorable.
+  row("c", "apikey", "Anthropic API", {
+    urls: ["https://console.anthropic.com"], folder: "Work", tags: ["ai"],
+    rotate_every_days: 90, rotated_at_ms: Date.now() - 95 * 86_400_000,
+    rotation_due_at_ms: Date.now() - 5 * 86_400_000, overdue: true,
+    previous_until_ms: Date.now() + 3 * 86_400_000,
+  }),
   row("n", "apikey", "Key with no value yet", { folder: "Work" }),
   row("d", "note", "Recovery codes", { folder: "Personal" }),
   row("e", "card", "Monzo debit", { folder: "Personal" }),
@@ -218,6 +230,8 @@ const MOCK_ROWS: ItemRow[] = [
 function mockWindow(): Window & {
   mortiseMockCliRequest?: CliRequest | null;
   mortiseMockCliAnswers?: { id: unknown; answer: unknown }[];
+  mortiseMockSaves?: { id: unknown; meta: unknown; payload: unknown }[];
+  mortiseMockRestores?: unknown[];
 } {
   return window;
 }
@@ -374,8 +388,17 @@ async function mock<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
       if (r?.kind === "note") return as({ kind: "SecureNote", body: "a note" });
       return as({ kind: "Login", password: "correct-horse-battery-staple", totp_seed: null, notes: null });
     }
-    case "save_item":
+    case "save_item": {
+      // Record what was sent so tests can check a save keeps every field.
+      const w = mockWindow();
+      (w.mortiseMockSaves ??= []).push({ id: args.id, meta: args.meta, payload: args.payload });
       return as(String(args.id ?? "f".repeat(32)));
+    }
+    case "restore_previous": {
+      const w = mockWindow();
+      (w.mortiseMockRestores ??= []).push(args.id);
+      return as(undefined);
+    }
     case "delete_item":
       mockState.rows = mockState.rows.filter((r) => r.id !== args.id);
       return as(undefined);
