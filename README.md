@@ -140,7 +140,8 @@ mortise run --project api --env dev -- npm run dev
 
 Starts the command with that environment's secrets in its environment, after
 you approve it in the app. Templates, `.mortise.toml` and the approval model
-are in [docs/cli.md](docs/cli.md).
+are in [docs/cli.md](docs/cli.md). Rotation reminders and restore are in
+[docs/rotation.md](docs/rotation.md).
 
 ### Some sample data
 
