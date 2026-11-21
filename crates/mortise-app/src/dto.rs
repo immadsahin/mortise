@@ -78,11 +78,33 @@ pub struct ItemRow {
     pub tags: Vec<String>,
     /// Last modified, milliseconds since the Unix epoch.
     pub updated_at_ms: u64,
+    /// Rotation policy in days, if any.
+    pub rotate_every_days: Option<u32>,
+    /// When the secret last changed. For items from before rotation
+    /// tracking this is the last write, the best time known.
+    pub rotated_at_ms: Option<u64>,
+    /// When rotation is due, if there is a policy.
+    pub rotation_due_at_ms: Option<u64>,
+    /// Due date has passed.
+    pub overdue: bool,
+    /// Until when the previous value can be restored, if one is kept.
+    pub previous_until_ms: Option<u64>,
 }
 
 impl From<ItemSummary> for ItemRow {
     fn from(s: ItemSummary) -> Self {
+        let now = mortise_vault::vault::now_ms();
+        let rotation_due_at_ms = s.meta.rotation_due_at_ms(s.updated_at_ms);
+        let has_secret = !matches!(
+            s.kind,
+            ItemKind::SecureNote | ItemKind::Card | ItemKind::Passkey
+        );
         Self {
+            rotate_every_days: s.meta.rotate_every_days,
+            rotated_at_ms: has_secret.then(|| s.meta.rotated_at_ms.unwrap_or(s.updated_at_ms)),
+            rotation_due_at_ms,
+            overdue: rotation_due_at_ms.is_some_and(|due| due <= now),
+            previous_until_ms: s.meta.previous_until_ms.filter(|until| *until > now),
             id: id_to_hex(s.id),
             kind: kind_name(s.kind),
             title: s.meta.title,

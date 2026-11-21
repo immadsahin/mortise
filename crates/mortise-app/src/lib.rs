@@ -131,6 +131,7 @@ pub fn run() {
             commands::forget_account_key,
             commands::search,
             commands::reveal,
+            commands::restore_previous,
             commands::save_item,
             commands::import_csv,
             commands::projects,

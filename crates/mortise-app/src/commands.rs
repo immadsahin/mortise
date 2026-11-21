@@ -245,7 +245,20 @@ pub fn reveal(state: State<'_, AppState>, id: String) -> CmdResult<ItemPayload> 
     let item_id = id_from_hex(&id).ok_or_else(|| CmdError::bad_request("Malformed item id."))?;
     state.with_vault(|vault| {
         let v = vault.ok_or_else(|| state.no_vault_error())?;
-        Ok(v.reveal(item_id)?)
+        // The previous value stays in Rust: restoring happens here, so the
+        // webview has no use for a second live secret.
+        Ok(v.reveal(item_id)?.without_previous())
+    })
+}
+
+/// Swap an item back to its previous value, within the restore window.
+#[tauri::command]
+pub fn restore_previous(state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    state.touch();
+    let item_id = id_from_hex(&id).ok_or_else(|| CmdError::bad_request("Malformed item id."))?;
+    state.with_vault(|vault| {
+        let v = vault.ok_or_else(|| state.no_vault_error())?;
+        Ok(v.restore_previous(item_id)?)
     })
 }
 
